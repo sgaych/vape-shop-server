@@ -1,5 +1,6 @@
 import hmac
 import hashlib
+import html
 import json
 import os
 import time
@@ -119,11 +120,9 @@ class CartIn(BaseModel):
     items: list[Line] = Field(max_length=50)
 
 
-class OrderIn(BaseModel):
-    user_id: int
-    username: str | None = None
-    first_name: str | None = None
+class CheckoutIn(BaseModel):
     meet: str = Field("", max_length=200)
+    age_ok: bool = False
     items: list[Line] = Field(min_length=1, max_length=50)
 
 
@@ -156,6 +155,49 @@ async def price_lines(conn, merged: dict[int, int], strict: bool) -> list[dict]:
         lines.append({"id": pid, "name": r["name"], "price": r["price"],
                       "img": r["img"], "category": r["category"], "qty": qty})
     return lines
+
+
+STATUS_LABEL = {
+    "new": "🆕 новая", "confirmed": "✅ подтверждена", "done": "📦 выдана",
+    "cancelled": "❌ отменена", "expired": "⌛ истекла",
+}
+
+
+async def tg_send(chat_id: int, text: str, reply_markup: dict | None = None):
+    """Отправка сообщения через Bot API. Ошибки не должны ломать создание брони."""
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload)
+    except httpx.HTTPError:
+        pass
+
+
+def format_order(o: dict) -> str:
+    lines = "\n".join(
+        f"• {html.escape(l['name'])} × {l['qty']} — {l['price'] * l['qty']} ₽" for l in o["lines"]
+    )
+    name = html.escape(o.get("first_name") or "Клиент")
+    uname = f" (@{html.escape(o['username'])})" if o.get("username") else ""
+    meet = html.escape(o.get("meet") or "не указано")
+    return (
+        f"🛒 <b>Бронь №{o['id']}</b> — {STATUS_LABEL[o['status']]}\n"
+        f"👤 <a href=\"tg://user?id={o['user_id']}\">{name}</a>{uname}\n\n"
+        f"{lines}\n\n"
+        f"💰 <b>Итого: {o['total']} ₽</b>\n"
+        f"📍 Встреча: {meet}\n\n"
+        f"🪪 Паспорт проверить до оплаты и выдачи."
+    )
+
+
+def new_order_kb(oid: int) -> dict:
+    return {"inline_keyboard": [
+        [{"text": "✅ Подтвердить", "callback_data": f"ord:{oid}:confirmed"},
+         {"text": "❌ Отменить", "callback_data": f"ord:{oid}:cancelled"}],
+        [{"text": "📦 Выдано", "callback_data": f"ord:{oid}:done"}],
+    ]}
 
 
 def order_out(r) -> dict:
@@ -252,8 +294,10 @@ async def update_cart(data: CartIn, user: dict = Depends(current_user)):
 
 
 # ---------- брони (только бот, по API-ключу) ----------
-@app.post("/orders", dependencies=[Depends(bot_only)])
-async def create_order(data: OrderIn):
+@app.post("/orders/checkout")
+async def checkout(data: CheckoutIn, user: dict = Depends(current_user)):
+    if not data.age_ok:
+        raise HTTPException(400, "Подтвердите, что вам есть 18 лет")
     async with app.state.pool.acquire() as conn:
         async with conn.transaction():
             lines = await price_lines(conn, merge(data.items), strict=True)
@@ -262,10 +306,21 @@ async def create_order(data: OrderIn):
             row = await conn.fetchrow(
                 "INSERT INTO orders (user_id, username, first_name, items, total, meet) "
                 "VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
-                data.user_id, data.username, data.first_name, stored, total, data.meet.strip(),
+                user["id"], user.get("username"), user.get("first_name"),
+                stored, total, data.meet.strip(),
             )
-            await conn.execute("DELETE FROM carts WHERE user_id = $1", data.user_id)
-    return order_out(row)
+            await conn.execute("DELETE FROM carts WHERE user_id = $1", user["id"])
+    o = order_out(row)
+
+    for admin_id in ADMIN_IDS:
+        await tg_send(admin_id, format_order(o), new_order_kb(o["id"]))
+    await tg_send(
+        user["id"],
+        f"✅ Бронь №{o['id']} на {o['total']} ₽ создана.\n\n"
+        "Владелец свяжется с вами для встречи. Оплата и выдача только при личной встрече, "
+        "возьмите паспорт.\nЕсли бронь не подтвердят в течение 24 часов, она снимется автоматически.",
+    )
+    return {"id": o["id"], "total": o["total"]}
 
 
 @app.post("/orders/{order_id}/status", dependencies=[Depends(bot_only)])
